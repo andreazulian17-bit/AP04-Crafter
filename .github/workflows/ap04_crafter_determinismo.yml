@@ -1,0 +1,111 @@
+name: AP04 - Crafter, controllo determinismo con patch
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Preleva il laboratorio
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installa Crafter ufficiale 1.8.3
+        run: python -m pip install 'crafter==1.8.3'
+
+      - name: Applica patch determinismo (proposta PR upstream 32)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import crafter
+          from importlib.metadata import version
+          
+          assert version('crafter') == '1.8.3', 'Versione Crafter inattesa'
+          root = pathlib.Path(crafter.__file__).resolve().parent
+          checks = []
+          
+          patches = [
+              (
+                  'engine.py',
+                  r'^(?P<i>[ \t]*)noise = self\._world\.random\.uniform\(32, 127, canvas\.shape\[:2\]\)\[\.\.\., None\]$',
+                  lambda m: (
+                      m['i'] + 'state = self._world.random.get_state()\n'
+                      + m['i'] + 'random = np.random.RandomState()\n'
+                      + m['i'] + 'random.set_state(state)\n'
+                      + m['i'] + 'noise = random.uniform(32, 127, canvas.shape[:2])[..., None]'
+                  ),
+              ),
+              (
+                  'env.py',
+                  r'^(?P<i>[ \t]*)creatures = \[obj for obj in objs if isinstance\(obj, cls\)\]$',
+                  lambda m: (
+                      m[0] + '\n' + m['i'] + 'creatures.sort(key=lambda x: tuple(x.pos))'
+                  ),
+              ),
+          ]
+          
+          for filename, pattern, replacement in patches:
+              target = root / filename
+              before = target.read_text(encoding='utf8')
+              match = list(re.finditer(pattern, before, re.MULTILINE))
+              if len(match) != 1:
+                  raise RuntimeError(f'{filename}: attesa 1 corrispondenza, trovate {len(match)}; patch non applicata')
+              after = re.sub(pattern, replacement, before, count=1, flags=re.MULTILINE)
+              compile(after, str(target), 'exec')
+              target.write_text(after, encoding='utf8')
+              checks.append({
+                  'file': str(target),
+                  'sha256_before': hashlib.sha256(before.encode()).hexdigest(),
+                  'sha256_after': hashlib.sha256(after.encode()).hexdigest(),
+              })
+          
+          pathlib.Path('crafter_patch_manifest.json').write_text(
+              json.dumps({
+                  'upstream_version': '1.8.3',
+                  'upstream_patch': 'https://github.com/danijar/crafter/pull/32',
+                  'description': 'Patch locale di ordinamento degli oggetti e RNG grafico; non e la versione ufficiale non modificata',
+                  'files': checks,
+              }, indent=2), encoding='utf8'
+          )
+          print('Patch applicata (NON ancora validata su Crafter):', checks)
+          PY
+
+      - name: Autotest della strumentazione (solo mock)
+        run: python AP04_Crafter_probe.py --self-test --output risultati_mock_check.json
+
+      - name: Prova sul vero Crafter modificato (12 semi)
+        shell: bash
+        run: |
+          mkdir -p risultati
+          for seed in {42..53}; do
+            python AP04_Crafter_probe.py --seed "$seed" --steps 80 --shock-at 12 --output "risultati/crafter_seed_${seed}.json"
+          done
+
+      - name: Sintesi e criterio GO/NO-GO
+        if: always()
+        run: |
+          if [ -d risultati ]; then
+            python AP04_analizza.py risultati
+          else
+            echo 'Nessun risultato generato'
+          fi
+
+      - name: Archivia dati e provenienza anche in caso di errore
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AP04_Crafter_patch_determinismo_tracciati
+          path: |
+            risultati/
+            risultati_mock_check.json
+            crafter_patch_manifest.json
