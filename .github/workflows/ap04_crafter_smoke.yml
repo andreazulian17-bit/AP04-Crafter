@@ -1,0 +1,41 @@
+
+name: AP04 - Crafter, prova tecnica reale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installa Crafter
+        run: python -m pip install crafter==1.8.3
+
+      - name: Autotest
+        run: python AP04_Crafter_probe.py --self-test
+
+      - name: Prove sul motore reale
+        shell: bash
+        run: |
+          mkdir -p risultati
+          for seed in {42..53}; do
+            python AP04_Crafter_probe.py --seed "$seed" --steps 80 --shock-at 12 --output "risultati/crafter_seed_${seed}.json"
+          done
+
+      - name: Analisi dei risultati
+        run: python AP04_analizza.py risultati
+
+      - name: Salva i risultati
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AP04_Crafter_tracciati
+          path: risultati/
