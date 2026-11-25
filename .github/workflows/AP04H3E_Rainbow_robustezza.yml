@@ -93,3 +93,219 @@ jobs:
               a = np.asarray(obs)
               return hashlib.sha256(a.tobytes()).hexdigest()[:20]
 
+
+          def worker(seed: int, condition: str):
+              OUT.mkdir(parents=True, exist_ok=True)
+              import numpy as np
+              import torch
+              import crafter
+
+              random.seed(seed)
+              np.random.seed(seed)
+              torch.manual_seed(seed)
+              torch.set_num_threads(2)
+
+              original_init = crafter.Env.__init__
+              original_reset = crafter.Env.reset
+              original_step = crafter.Env.step
+              signature = inspect.signature(original_init)
+              if 'seed' not in signature.parameters:
+                  raise RuntimeError('Crafter Env: constructor without seed argument')
+
+              trial = {
+                  'seed': seed,
+                  'condition': condition,
+                  'checkpoint': CHECKPOINT,
+                  'window': [LOCK_START, LOCK_STOP],
+                  'initial_hash': None,
+                  'length': 0,
+                  'reward': 0.0,
+                  'blocked_moves': 0,
+                  'movement_after': 0,
+                  'finished': False,
+                  'health_end': None,
+                  'achievements': {},
+                  'reset_count': 0,
+                  'env_count': 0,
+                  'action_names_validated': False,
+              }
+
+              def patched_init(self, *args, **kwargs):
+                  trial['env_count'] += 1
+                  bound = signature.bind_partial(self, *args, **kwargs)
+                  bound.arguments['seed'] = seed
+                  return original_init(*bound.args, **bound.kwargs)
+
+              def patched_reset(self, *args, **kwargs):
+                  result = original_reset(self, *args, **kwargs)
+                  trial['reset_count'] += 1
+                  obs = result[0] if isinstance(result, tuple) and len(result) == 2 else result
+                  trial['initial_hash'] = as_hash(obs)
+                  return result
+
+              def patched_step(self, action, *args, **kwargs):
+                  if not trial['action_names_validated']:
+                      names = tuple(self.action_names[:6])
+                      expected = ('noop', 'move_left', 'move_right',
+                                  'move_up', 'move_down', 'do')
+                      if names != expected:
+                          raise RuntimeError(f'Action mapping changed: {names!r}')
+                      trial['action_names_validated'] = True
+                  t = trial['length']
+                  original_action = int(action)
+                  actual_action = original_action
+                  if condition == 'lockout' and LOCK_START <= t < LOCK_STOP and original_action in (1, 2, 3, 4):
+                      actual_action = 0
+                      trial['blocked_moves'] += 1
+                  if t >= LOCK_STOP and original_action in (1, 2, 3, 4):
+                      trial['movement_after'] += 1
+                  result = original_step(self, actual_action, *args, **kwargs)
+                  if len(result) == 4:
+                      _, reward, done, info = result
+                  elif len(result) == 5:
+                      _, reward, terminated, truncated, info = result
+                      done = bool(terminated or truncated)
+                  else:
+                      raise RuntimeError(f'Unexpected Crafter step result: {len(result)}')
+                  trial['length'] += 1
+                  trial['reward'] += float(reward)
+                  trial['finished'] = bool(done)
+                  if isinstance(info, dict):
+                      achievements = info.get('achievements')
+                      if isinstance(achievements, dict):
+                          trial['achievements'] = {str(k): int(v) for k, v in achievements.items()}
+                      inv = info.get('inventory')
+                      if isinstance(inv, dict) and 'health' in inv:
+                          trial['health_end'] = float(inv['health'])
+                  return result
+
+              crafter.Env.__init__ = patched_init
+              crafter.Env.reset = patched_reset
+              crafter.Env.step = patched_step
+              sys.argv = ['scripts/evaluate.py', CHECKPOINT, '--episodes', '1', '--device', 'cpu']
+              try:
+                  try:
+                      runpy.run_path('scripts/evaluate.py', run_name='__main__')
+                  except SystemExit as exc:
+                      if exc.code not in (0, None):
+                          raise
+              finally:
+                  crafter.Env.__init__ = original_init
+                  crafter.Env.reset = original_reset
+                  crafter.Env.step = original_step
+
+              if trial['reset_count'] != 1 or trial['env_count'] != 1:
+                  raise RuntimeError(f'Unexpected evaluation topology: envs={trial["env_count"]}, resets={trial["reset_count"]}')
+              if not trial['action_names_validated'] or trial['length'] == 0:
+                  raise RuntimeError('Evaluation did not reach underlying Crafter.Env.step')
+              if trial['initial_hash'] is None:
+                  raise RuntimeError('No initial observation hash')
+              trial['distinct_achievements'] = sum(v > 0 for v in trial['achievements'].values())
+              trial['movement_resumed'] = bool(trial['movement_after'] >= 2)
+              path = OUT / f'{condition}_{seed}.json'
+              path.write_text(json.dumps(trial, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+              print('AP04H3E_RESULT', json.dumps(trial, sort_keys=True))
+
+
+          def main():
+              OUT.mkdir(parents=True, exist_ok=True)
+              rows = []
+              errors = []
+              for seed in SEEDS:
+                  for condition in ('baseline', 'lockout'):
+                      name = f'{condition}_{seed}'
+                      print('Inizio prova:', name, flush=True)
+                      result = subprocess.run(
+                          [sys.executable, __file__, '--worker', '--seed', str(seed), '--condition', condition],
+                          cwd=Path(__file__).parent,
+                          env={**os.environ, 'PYTHONHASHSEED': str(seed), 'OMP_NUM_THREADS': '2', 'MKL_NUM_THREADS': '2'},
+                          capture_output=True, text=True, timeout=600,
+                      )
+                      (OUT / f'{name}.log').write_text(result.stdout + '\nSTDERR:\n' + result.stderr, encoding='utf-8')
+                      if result.returncode:
+                          errors.append(f'{name}: exit {result.returncode} (see log)')
+                          print('ERRORE:', errors[-1], flush=True)
+                      else:
+                          rows.append(json.loads((OUT / f'{name}.json').read_text(encoding='utf-8')))
+              with (OUT / 'episodi.csv').open('w', newline='', encoding='utf-8') as file:
+                  fields = ['seed', 'condition', 'initial_hash', 'length', 'reward',
+                            'distinct_achievements', 'blocked_moves', 'movement_after',
+                            'movement_resumed', 'health_end', 'finished', 'reset_count', 'env_count']
+                  writer = csv.DictWriter(file, fieldnames=fields, extrasaction='ignore')
+                  writer.writeheader()
+                  writer.writerows(rows)
+              by_key = {(int(r['seed']), r['condition']): r for r in rows}
+              pairs = []
+              for seed in SEEDS:
+                  base = by_key.get((seed, 'baseline'))
+                  lock = by_key.get((seed, 'lockout'))
+                  if base is None or lock is None:
+                      errors.append(f'Incomplete pair for {seed}')
+                  elif base['initial_hash'] != lock['initial_hash']:
+                      errors.append(f'DIFFERENT INITIAL WORLDS for {seed}: {base["initial_hash"]} != {lock["initial_hash"]}')
+                  else:
+                      pairs.append((base, lock))
+              exposed = [(b, p) for b, p in pairs if p['blocked_moves'] > 0]
+              text = [
+                  'AP04H3E - Rainbow-IQN frozen-policy resilience pilot',
+                  f'Paired seeds: {len(pairs)}/{len(SEEDS)}; exposed pairs: {len(exposed)}',
+                  f'Lockout movement actions 1..4 -> noop=0 for t=[{LOCK_START},{LOCK_STOP})',
+                  'No training; measures robustness/duration, NOT learning or H3.',
+                  'Pair validation: identical RGB initial observation hashes.',
+                  'Recovery proxy: at least two movement decisions AFTER t=46, not structural adaptation.',
+              ]
+              if exposed:
+                  for key in ('length', 'reward', 'distinct_achievements'):
+                      delta = [p[key] - b[key] for b, p in exposed]
+                      text.append(f'{key}: baseline avg={statistics.mean(b[key] for b, _ in exposed):.3f}, '
+                                  f'lockout avg={statistics.mean(p[key] for _, p in exposed):.3f}, '
+                                  f'paired avg difference={statistics.mean(delta):+.3f}, median diff={statistics.median(delta):+.3f}')
+                  text.append(f'Movement resumed (lockout): {sum(p["movement_resumed"] for _, p in exposed)}/{len(exposed)}')
+                  text.append(f'Block count: {sum(p["blocked_moves"] for _, p in exposed)}')
+              else:
+                  text.append('NO VALID EXPOSURE: experiment inconclusive.')
+              if errors:
+                  text.extend(['ERRORS / VALIDITY WARNINGS:'] + errors)
+              else:
+                  text.append('No pairing / runtime errors.')
+              text += [
+                  'Interpretation: a higher duration in lockout does not prove resilience;'
+                  ' the lockout can also prevent dangerous actions.',
+                  'Even a positive recovery pattern cannot establish endogenous novelty or EIM.',
+                  'This is a low-N technical pilot; no significance test or causal claim about Gamma.',
+              ]
+              (OUT / 'sintesi.txt').write_text('\n'.join(text) + '\n', encoding='utf-8')
+              print('\n'.join(text), flush=True)
+              if errors:
+                  raise SystemExit(2)
+
+
+          if __name__ == '__main__':
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--worker', action='store_true')
+              parser.add_argument('--seed', type=int)
+              parser.add_argument('--condition', choices=('baseline', 'lockout'))
+              args = parser.parse_args()
+              if args.worker:
+                  worker(args.seed, args.condition)
+              else:
+                  main()
+          PY
+          python -m py_compile agente_rainbow/AP04H3E_perturbazione.py
+
+      - name: Confronta 10 coppie di episodi - baseline e blocco movimento
+        shell: bash
+        working-directory: agente_rainbow
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+          python AP04H3E_perturbazione.py 2>&1 | tee ../risultati_AP04H3E/esecuzione.log
+
+      - name: Salva i tracciati anche in caso di errore
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: AP04H3E_Rainbow_robustezza
+          if-no-files-found: warn
+          path: |
+            risultati_AP04H3E/
