@@ -1,0 +1,263 @@
+name: AP04H3F - Controllo A-A Rainbow stesso seme senza perturbazione
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ap04h3f:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      WANDB_MODE: disabled
+      WANDB_SILENT: 'true'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Preleva AP04-Crafter
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Prepara Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Preleva Rainbow-IQN v1.0.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch v1.0.0 https://github.com/v-ade-r/Rainbow_IQN_Crafter.git agente_rainbow
+          mkdir -p risultati_AP04H3F
+          git -C agente_rainbow rev-parse HEAD > risultati_AP04H3F/commit_agente.txt
+
+      - name: Installa dipendenze su CPU
+        shell: bash
+        working-directory: agente_rainbow
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install 'torch>=2.2' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+
+      - name: Scarica lo stesso checkpoint finale verificato
+        shell: bash
+        working-directory: agente_rainbow
+        run: |
+          set -euo pipefail
+          mkdir -p checkpoints
+          curl --fail --location --show-error --silent --retry 3 \
+            'https://github.com/v-ade-r/Rainbow_IQN_Crafter/releases/download/v1.0.0/rainbow_iqn_agent_final.pt' \
+            --output checkpoints/agent_final.pt
+          test "$(stat -c%s checkpoints/agent_final.pt)" -gt 10000000
+          sha256sum checkpoints/agent_final.pt > ../risultati_AP04H3F/sha256_checkpoint.txt
+
+      - name: Prepara controllo A-A completo
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > agente_rainbow/AP04H3F_controllo_AA.py <<'PY'
+          #!/usr/bin/env python3
+          """AP04H3F: A/A control, same Rainbow-IQN policy, seed, no perturbation."""
+          import argparse
+          import hashlib
+          import inspect
+          import json
+          import os
+          import random
+          import runpy
+          import subprocess
+          import sys
+          from pathlib import Path
+          
+          SEED = 71007  # anomaly: no block but baseline/lockout diverged in AP04H3E
+          OUT = Path('../risultati_AP04H3F')
+          MODEL = 'checkpoints/agent_final.pt'
+          
+          
+          def digest(obs):
+              import numpy as np
+              arr = np.asarray(obs)
+              return hashlib.sha256(arr.tobytes()).hexdigest()
+          
+          
+          def worker(label):
+              import crafter
+              import numpy as np
+              import torch
+          
+              random.seed(SEED)
+              np.random.seed(SEED)
+              torch.manual_seed(SEED)
+              torch.set_num_threads(2)
+              entry = {'seed': SEED, 'run': label, 'initial_hash': None,
+                       'num_envs': 0, 'num_resets': 0, 'action_mapping_ok': False,
+                       'trace': [], 'length': 0, 'reward': 0.,
+                       'achievements': {}, 'terminated': False}
+              original_init = crafter.Env.__init__
+              original_reset = crafter.Env.reset
+              original_step = crafter.Env.step
+              signature = inspect.signature(original_init)
+              if 'seed' not in signature.parameters:
+                  raise RuntimeError('Crafter.Env.__init__ has no seed argument')
+          
+              def patched_init(self, *args, **kwargs):
+                  entry['num_envs'] += 1
+                  bound = signature.bind_partial(self, *args, **kwargs)
+                  bound.arguments['seed'] = SEED
+                  return original_init(*bound.args, **bound.kwargs)
+          
+              def patched_reset(self, *args, **kwargs):
+                  result = original_reset(self, *args, **kwargs)
+                  entry['num_resets'] += 1
+                  obs = result[0] if isinstance(result, tuple) and len(result) == 2 else result
+                  entry['initial_hash'] = digest(obs)
+                  return result
+          
+              def patched_step(self, action, *args, **kwargs):
+                  if not entry['action_mapping_ok']:
+                      expected = ('noop', 'move_left', 'move_right', 'move_up', 'move_down', 'do')
+                      if tuple(self.action_names[:6]) != expected:
+                          raise RuntimeError('Crafter action mapping differs from AP04H3E')
+                      entry['action_mapping_ok'] = True
+                  chosen = int(action)
+                  # A/A: NO conversion, lockout, or environmental modification.
+                  result = original_step(self, chosen, *args, **kwargs)
+                  if len(result) == 4:
+                      obs, rew, done, info = result
+                  elif len(result) == 5:
+                      obs, rew, term, trunc, info = result
+                      done = bool(term or trunc)
+                  else:
+                      raise RuntimeError(f'Unexpected Env.step output length {len(result)}')
+                  entry['trace'].append({'step': len(entry['trace']), 'action': chosen,
+                                         'observation': digest(obs),
+                                         'reward': float(rew), 'done': bool(done)})
+                  entry['length'] += 1
+                  entry['reward'] += float(rew)
+                  entry['terminated'] = bool(done)
+                  if isinstance(info, dict) and isinstance(info.get('achievements'), dict):
+                      entry['achievements'] = {str(k): int(v) for k, v in info['achievements'].items()}
+                  return result
+          
+              crafter.Env.__init__ = patched_init
+              crafter.Env.reset = patched_reset
+              crafter.Env.step = patched_step
+              sys.argv = ['scripts/evaluate.py', MODEL, '--episodes', '1', '--device', 'cpu']
+              try:
+                  try:
+                      runpy.run_path('scripts/evaluate.py', run_name='__main__')
+                  except SystemExit as exc:
+                      if exc.code not in (0, None):
+                          raise
+              finally:
+                  crafter.Env.__init__ = original_init
+                  crafter.Env.reset = original_reset
+                  crafter.Env.step = original_step
+          
+              if entry['num_envs'] != 1 or entry['num_resets'] != 1 or not entry['action_mapping_ok'] or not entry['trace']:
+                  raise RuntimeError('Unexpected evaluation setup / no episode steps')
+              if entry['initial_hash'] is None:
+                  raise RuntimeError('Missing initial observation')
+              entry['unlocked'] = sum(v > 0 for v in entry['achievements'].values())
+              (OUT / f'{label}.json').write_text(json.dumps(entry, indent=2) + '\n', encoding='utf-8')
+              print(f'{label}: {entry["length"]} steps, {entry["unlocked"]} achievements', flush=True)
+          
+          
+          def main():
+              OUT.mkdir(parents=True, exist_ok=True)
+              problems = []
+              for label in ('A1', 'A2'):
+                  print(f'Starting unperturbed {label}, seed={SEED}', flush=True)
+                  try:
+                      proc = subprocess.run(
+                          [sys.executable, __file__, '--worker', label],
+                          cwd=Path(__file__).parent,
+                          env={**os.environ, 'PYTHONHASHSEED': str(SEED),
+                               'OMP_NUM_THREADS': '2', 'MKL_NUM_THREADS': '2'},
+                          capture_output=True, text=True, timeout=600)
+                      (OUT / f'{label}.log').write_text(proc.stdout + '\nSTDERR:\n' + proc.stderr, encoding='utf-8')
+                      if proc.returncode:
+                          problems.append(f'{label} failed, exit={proc.returncode}; see {label}.log')
+                  except subprocess.TimeoutExpired:
+                      problems.append(f'{label}: timeout 600 seconds')
+              lines = ['AP04H3F - A/A reproducibility control (NO perturbation)',
+                       f'Seed = {SEED}; model = {MODEL}; repeated one-episode evaluation.',
+                       'Frozen weights, same software, fresh Python process per run.',
+                       'Full trace: chosen actions, resulting observations, rewards and done.',
+                       'This is a methodological check, NOT a test of H3 or EIM.']
+              report = {'seed': SEED, 'problems': problems, 'status': 'INCONCLUSIVE'}
+              if not problems:
+                  a, b = [json.loads((OUT / f'{label}.json').read_text(encoding='utf-8')) for label in ('A1', 'A2')]
+                  initial_equal = a['initial_hash'] == b['initial_hash']
+                  report['initial_observation_equal'] = initial_equal
+                  report['lengths'] = {'A1': a['length'], 'A2': b['length']}
+                  report['rewards'] = {'A1': a['reward'], 'A2': b['reward']}
+                  lines.append('Initial RGB observation matches: ' + str(initial_equal))
+                  first = None
+                  if not initial_equal:
+                      first = {'step': 0, 'field': 'initial_observation',
+                               'A1': a['initial_hash'], 'A2': b['initial_hash']}
+                  else:
+                      for i, (left, right) in enumerate(zip(a['trace'], b['trace'])):
+                          for field in ('action', 'observation', 'reward', 'done'):
+                              if left[field] != right[field]:
+                                  first = {'step': i, 'field': field,
+                                           'A1': left[field], 'A2': right[field]}
+                                  break
+                          if first is not None:
+                              break
+                      if first is None and len(a['trace']) != len(b['trace']):
+                          first = {'step': min(len(a['trace']), len(b['trace'])),
+                                   'field': 'trace_length',
+                                   'A1': len(a['trace']), 'A2': len(b['trace'])}
+                  report['first_divergence'] = first
+                  report['status'] = 'REPRODUCIBLE' if first is None else 'NON_REPRODUCIBLE'
+                  lines.append('RESULT: ' + report['status'])
+                  if first:
+                      lines.append('First divergence: ' + json.dumps(first, ensure_ascii=False))
+                      if first['field'] == 'action':
+                          lines.append('Same recorded history until that point, different action: investigate policy/inference randomness.')
+                      elif first['field'] in ('observation', 'reward', 'done'):
+                          lines.append('Same recorded action until that point, different result: investigate environment/hidden state randomness.')
+                      else:
+                          lines.append('Different initial observation or trajectory length: investigate environment/runtime conditions.')
+                  else:
+                      lines.append('Two trajectories match exactly on the recorded fields for this seed only.')
+              else:
+                  lines += ['INCONCLUSIVE'] + problems
+              lines.append('Identical visible images do not certify identical hidden simulator state.')
+              (OUT / 'confronto.json').write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+              (OUT / 'sintesi.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+              print('\n'.join(lines), flush=True)
+              if problems:
+                  raise SystemExit(2)
+          
+          
+          if __name__ == '__main__':
+              p = argparse.ArgumentParser()
+              p.add_argument('--worker', action='store_true')
+              p.add_argument('label', nargs='?', choices=('A1', 'A2'))
+              args = p.parse_args()
+              worker(args.label) if args.worker else main()
+          PY
+          python -m py_compile agente_rainbow/AP04H3F_controllo_AA.py
+
+      - name: Esegui due episodi identici senza perturbazioni
+        shell: bash
+        working-directory: agente_rainbow
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+          python AP04H3F_controllo_AA.py 2>&1 | tee ../risultati_AP04H3F/esecuzione.log
+
+      - name: Archivia tracciati e confronto
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: AP04H3F_Rainbow_controllo_AA
+          if-no-files-found: warn
+          path: |
+            risultati_AP04H3F/
