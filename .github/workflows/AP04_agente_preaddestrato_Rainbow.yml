@@ -64,6 +64,7 @@ jobs:
           set -euo pipefail
           # Non e' un test di H3 e non misura la velocita' di apprendimento.
           # Il checkpoint .pt esterno viene caricato soltanto nel runner GitHub.
+          export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
           python scripts/evaluate.py checkpoints/agent_final.pt --episodes 8 --device cpu \
             2>&1 | tee ../risultati_pretrained/eval_8_episodi.log
 
