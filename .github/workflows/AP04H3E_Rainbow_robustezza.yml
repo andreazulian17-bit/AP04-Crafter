@@ -1,0 +1,95 @@
+name: AP04H3E - Rainbow resilienza con blocco movimento
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ap04h3e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      WANDB_MODE: disabled
+      WANDB_SILENT: 'true'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Preleva AP04-Crafter
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Prepara Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Preleva Rainbow-IQN v1.0.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch v1.0.0 https://github.com/v-ade-r/Rainbow_IQN_Crafter.git agente_rainbow
+          mkdir -p risultati_AP04H3E
+          git -C agente_rainbow rev-parse HEAD > risultati_AP04H3E/commit_agente.txt
+
+      - name: Installa dipendenze su CPU
+        shell: bash
+        working-directory: agente_rainbow
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install 'torch>=2.2' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+
+      - name: Scarica lo stesso checkpoint finale verificato
+        shell: bash
+        working-directory: agente_rainbow
+        run: |
+          set -euo pipefail
+          mkdir -p checkpoints
+          curl --fail --location --show-error --silent --retry 3 \
+            'https://github.com/v-ade-r/Rainbow_IQN_Crafter/releases/download/v1.0.0/rainbow_iqn_agent_final.pt' \
+            --output checkpoints/agent_final.pt
+          test "$(stat -c%s checkpoints/agent_final.pt)" -gt 10000000
+          sha256sum checkpoints/agent_final.pt > ../risultati_AP04H3E/sha256_checkpoint.txt
+
+      - name: Prepara il test AP04H3E - protocollo fissato
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > agente_rainbow/AP04H3E_perturbazione.py <<'PY'
+          #!/usr/bin/env python3
+          """AP04H3E: pairs of frozen Rainbow-IQN policy evaluations.
+
+          Each worker runs the author's evaluation for exactly one episode, with
+          crafter.Env seeded explicitly and an optional temporary movement lockout.
+          All outputs are in risultati_AP04H3E; there is no learning or weight update.
+          """
+          from __future__ import annotations
+
+          import argparse
+          import csv
+          import hashlib
+          import inspect
+          import json
+          import os
+          import random
+          import runpy
+          import statistics
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          SEEDS = tuple(range(71001, 71011))
+          LOCK_START = 20  # zero-indexed environment step
+          LOCK_STOP = 46   # first unblocked step, exclusive
+          OUT = Path('../risultati_AP04H3E')
+          CHECKPOINT = 'checkpoints/agent_final.pt'
+
+
+          def as_hash(obs):
+              import numpy as np
+              a = np.asarray(obs)
+              return hashlib.sha256(a.tobytes()).hexdigest()[:20]
+
